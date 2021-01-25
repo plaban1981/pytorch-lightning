@@ -11,149 +11,68 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License
-import os
-import subprocess
-import sys
-from os.path import abspath
-from time import sleep
 from typing import Any, List, Optional, Union
 
-import numpy as np
 import torch
 import torch.distributed as torch_distrib
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
 from pytorch_lightning import _logger as log
-from pytorch_lightning.accelerators.accelerator import Accelerator, ReduceOp
+from pytorch_lightning.accelerators.legacy.accelerator import Accelerator, ReduceOp
 from pytorch_lightning.cluster_environments import ClusterEnvironment
 from pytorch_lightning.core.lightning import LightningModule
 from pytorch_lightning.distributed.dist import LightningDistributed
 from pytorch_lightning.plugins.ddp_plugin import DDPPlugin
 from pytorch_lightning.plugins.rpc_plugin import RPCPlugin
-from pytorch_lightning.utilities import _HYDRA_AVAILABLE, AMPType
-from pytorch_lightning.utilities.distributed import (
-    all_gather_ddp_if_available,
-    find_free_network_port,
-    rank_zero_only,
-    sync_ddp_if_available,
-)
-from pytorch_lightning.utilities.exceptions import MisconfigurationException
-from pytorch_lightning.utilities.seed import seed_everything
-
-if _HYDRA_AVAILABLE:
-    from hydra.core.hydra_config import HydraConfig
-    from hydra.utils import get_original_cwd, to_absolute_path
+from pytorch_lightning.utilities import AMPType
+from pytorch_lightning.utilities.distributed import all_gather_ddp_if_available, rank_zero_only, sync_ddp_if_available
 
 
-class DDPAccelerator(Accelerator):
+class DDPHPCAccelerator(Accelerator):
 
     def __init__(self,
-                 trainer: Optional = None,
+                 trainer,
                  cluster_environment: Optional[ClusterEnvironment] = None,
                  ddp_plugin: Optional[DDPPlugin] = None):
         """
-        Runs training using DDP strategy on a single machine (manually, not via cluster start)
+        Runs training using DDP on an HPC cluster
 
         Example::
 
             # default
-            trainer = Trainer(accelerator=DDPAccelerator())
+            trainer = Trainer(accelerator=DDPHPCAccelerator())
 
         """
         super().__init__(trainer, cluster_environment, ddp_plugin)
         self.task_idx = None
         self._has_spawned_children = False
-        self.interactive_ddp_procs = []
         self.dist = LightningDistributed()
         self.nickname = 'ddp'
 
     def setup(self, model):
-        # first track model
         self.trainer.model = model
-
-        # start the other scripts
-        if os.environ.get('PL_IN_DDP_SUBPROCESS', '0') != '1':
-            self._call_children_scripts()
-
-        # set the task idx
-        self.task_idx = int(os.environ['LOCAL_RANK'])
-
-    def _call_children_scripts(self):
-        assert self.trainer.global_rank == 0
-        self._check_can_spawn_children()
-        self._has_spawned_children = True
-
-        os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', '127.0.0.1')
-        os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', str(find_free_network_port()))
-
-        # allow the user to pass the node rank
-        node_rank = '0'
-        node_rank = os.environ.get('NODE_RANK', node_rank)
-        node_rank = os.environ.get('GROUP_RANK', node_rank)
-        os.environ['NODE_RANK'] = node_rank
-        os.environ['LOCAL_RANK'] = '0'
-
-        # when user is using hydra find the absolute path
-        path_lib = abspath if not _HYDRA_AVAILABLE else to_absolute_path
-
-        # pull out the commands used to run the script and resolve the abs file path
-        command = sys.argv
-        try:
-            full_path = path_lib(command[0])
-        # todo: specify the possible exception
-        except Exception:
-            full_path = abspath(command[0])
-
-        command[0] = full_path
-        # use the same python interpreter and actually running
-        command = [sys.executable] + command
-
-        # the visible devices tell us how many GPUs we want to use.
-        # when the trainer script was called the device has already been scoped by the time
-        # code reaches this point. so, to call the scripts, we need to leave cuda visible devices alone
-        # but forward the GPUs selected via environment variables
-        if self.trainer.data_parallel_device_ids is None:
-            raise MisconfigurationException('you selected (distribute_backend = ddp) but did not set Trainer(gpus=?)')
-
-        os.environ['PL_TRAINER_GPUS'] = ','.join([str(i) for i in self.trainer.data_parallel_device_ids])
-        os.environ['PL_IN_DDP_SUBPROCESS'] = '1'
-
-        if self.trainer.logger is not None:
-            os.environ['PL_EXP_VERSION'] = str(self.trainer.logger.version)
-
-        num_gpus = len(self.trainer.data_parallel_device_ids)
-        os.environ['WORLD_SIZE'] = f'{num_gpus * self.trainer.num_nodes}'
-
-        self.interactive_ddp_procs = []
-        for local_rank in range(1, self.trainer.num_processes):
-            env_copy = os.environ.copy()
-            env_copy['LOCAL_RANK'] = f'{local_rank}'
-
-            # remove env var if global seed not set
-            if os.environ.get('PL_GLOBAL_SEED') is None and 'PL_GLOBAL_SEED' in env_copy:
-                del env_copy['PL_GLOBAL_SEED']
-
-            # start process
-            # if hydra is available and initialized, make sure to set the cwd correctly
-            cwd: Optional[str] = None
-            if _HYDRA_AVAILABLE:
-                if HydraConfig.initialized():
-                    cwd = get_original_cwd()
-            proc = subprocess.Popen(command, env=env_copy, cwd=cwd)
-            self.interactive_ddp_procs.append(proc)
-
-            # starting all processes at once can cause issues
-            # with dataloaders delay between 1-10 seconds
-            delay = np.random.uniform(1, 5, 1)[0]
-            sleep(delay)
+        self.task_idx = self.cluster_environment.local_rank()
 
     def train(self):
         model = self.trainer.model
+        self.ddp_train(process_idx=self.task_idx, model=model)
 
-        results = self.ddp_train(process_idx=self.task_idx, model=model)
-        if 'WORLD_SIZE' in os.environ:
-            del os.environ['WORLD_SIZE']
-        return results
+    def set_world_ranks(self, process_idx):
+        self.trainer.local_rank = process_idx
+        self.trainer.global_rank = self.trainer.node_rank * self.trainer.num_processes + process_idx
+        self.trainer.world_size = self.trainer.num_nodes * self.trainer.num_processes
+
+    def init_device(self, process_idx):
+        self.trainer.root_gpu = process_idx
+        torch.cuda.set_device(self.trainer.root_gpu)
+
+    def model_to_device(self, model):
+        model.cuda(self.trainer.root_gpu)
+
+    def get_device_ids(self):
+        device_ids = [self.trainer.root_gpu]
+        return device_ids
 
     def training_step(self, args):
         return self._step(args)
@@ -174,48 +93,18 @@ class DDPAccelerator(Accelerator):
         return output
 
     def barrier(self, name: Optional[str] = None):
-        if self.rpc_enabled:
-            # Allow RPC to handle barrier on main RPC processes
-            self.ddp_plugin.barrier()
-        elif torch_distrib.is_initialized():
-            torch_distrib.barrier(group=self.ddp_plugin.data_parallel_group)
-
-    def _check_can_spawn_children(self):
-        if self._has_spawned_children:
-            raise RuntimeError(
-                "You tried to run `.fit` or `.test` multiple times in the same script."
-                " This is not supported in DDP mode, switch to `accelerator='ddp_spawn'` instead."
-            )
-
-    def set_world_ranks(self, process_idx):
-        self.trainer.local_rank = process_idx
-        self.trainer.global_rank = self.trainer.node_rank * self.trainer.num_processes + process_idx
-        self.trainer.world_size = self.trainer.num_nodes * self.trainer.num_processes
-
-    def init_device(self, process_idx):
-        # Todo: required argument `process_idx` is not used
-        self.trainer.root_gpu = self.trainer.data_parallel_device_ids[self.trainer.local_rank]
-        torch.cuda.set_device(self.trainer.root_gpu)
-
-    def model_to_device(self, model):
-        model.cuda(self.trainer.root_gpu)
-
-    def get_device_ids(self):
-        device_ids = [self.trainer.root_gpu]
-        return device_ids
-
-    def on_train_end(self):
-        pass
+        if torch_distrib.is_initialized():
+            torch_distrib.barrier()
 
     def early_stopping_should_stop(self, pl_module):
         stop = torch.tensor(int(self.trainer.should_stop), device=pl_module.device)
-        torch_distrib.all_reduce(stop, op=torch_distrib.reduce_op.SUM)
-        self.barrier('early_stopping')
+        dist.all_reduce(stop, op=dist.reduce_op.SUM)
+        dist.barrier()
         should_stop = stop == self.trainer.world_size
         return should_stop
 
     def broadcast(self, obj, src=0):
-        return self.dist.broadcast(obj, group=self.ddp_plugin.data_parallel_group)
+        return self.dist.broadcast(obj)
 
     def ddp_train(self, process_idx, model):
         """
@@ -229,22 +118,16 @@ class DDPAccelerator(Accelerator):
             Dict with evaluation results
 
         """
-        seed = os.environ.get("PL_GLOBAL_SEED")
-        if seed is not None:
-            seed_everything(int(seed))
+        # determine which process we are and world size
+        self.set_world_ranks(process_idx)
+        self.init_device(process_idx)
 
-        # show progressbar only on progress_rank 0
+        # toggle prog bar
         if (self.trainer.node_rank != 0 or process_idx != 0) and self.trainer.progress_bar_callback is not None:
             self.trainer.progress_bar_callback.disable()
 
-        # determine which process we are and world size
-        self.set_world_ranks(process_idx)
-
         # set warning rank
         rank_zero_only.rank = self.trainer.global_rank
-
-        # Initialize cuda device
-        self.init_device(process_idx)
 
         # set up server using proc 0's ip address
         # try to init for 20 times at max in case ports are taken
@@ -286,6 +169,8 @@ class DDPAccelerator(Accelerator):
         # allow for lr schedulers as well
         self.setup_optimizers(model)
 
+        self.ddp_plugin.on_after_setup_optimizers(self.trainer)
+
         # set model properties before going into wrapper
         self.trainer.model_connector.copy_trainer_model_properties(model)
 
@@ -301,7 +186,6 @@ class DDPAccelerator(Accelerator):
         model = self.configure_ddp(model, device_ids)
 
         # set up training routine
-        self.barrier('ddp_setup')
         self.trainer.train_loop.setup_training(model)
 
         # train or test
@@ -339,9 +223,6 @@ class DDPAccelerator(Accelerator):
                     tensor: Union[torch.Tensor],
                     group: Optional[Any] = None,
                     reduce_op: Optional[Union[ReduceOp, str]] = None) -> torch.Tensor:
-        """
-
-        """
         return sync_ddp_if_available(tensor, group, reduce_op)
 
     def all_gather(self, tensor: Union[torch.Tensor], group: Optional[Any] = None, sync_grads: bool = False):
